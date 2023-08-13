@@ -539,6 +539,7 @@ int wordle_server(int argc, char **argv) {
     if (readDict(dict_in, dict, dict_size) != 0) {
         // I cant make any guarantees about the state of dict here.
         // Better off just stopping and letting the system clean it up. :<
+        // This is a bad way to do this
         return EXIT_FAILURE;
     }
 
