@@ -92,11 +92,14 @@ void strlower(char *str) {
 }
 
 // we do a bit of uppercasing
-char *strupper(char *str) {
+// I need to make this return a copy just for the words global array
+// because everywhere else in my code I use a lowercased version of this string.
+char *strupper(char *str, char *o) {
     for (int i = 0; i < strlen(str); i++) {
-        *(str + i) = toupper(*(str + i));
+        *(o + i) = toupper(*(str + i));
     }
-    return str;
+    *(o + strlen(str)) = '\0';
+    return o;
 }
 // Compares the guess given by the client to the wordle being played against
 //  according to the wordle algorithm. Returns a string in result where correct
@@ -191,7 +194,7 @@ void *do_on_thread(void *arguments) {
     int csd = thread_args->csd;
     char **dict = thread_args->dictionary;
     int dict_sz = thread_args->dict_len;
-    char **tmp_words;
+    char **tmp_words, *tmp;
     struct List *running_threads = thread_args->thread_list;
     // which word from the dictionary is our game played against?
     int dict_index = rand() % dict_sz;
@@ -218,12 +221,11 @@ void *do_on_thread(void *arguments) {
     // We have our word, we can now add it to the global set of words used.
     pthread_mutex_lock(&mutex_words);
     {
+        tmp = calloc(6, sizeof(char));
         tmp_words = realloc(words, sizeof(char *) * (words_size + 1));
         if (tmp_words != NULL) {
-            // TODO: Pretty sure this is a problem, I think i have to allocate
-            // lhs first...
             *(tmp_words + words_size - 1) = calloc(1, sizeof(char *));
-            strcpy(*(tmp_words + words_size - 1), strupper(wordle));
+            strcpy(*(tmp_words + words_size - 1), strupper(wordle, tmp));
             *(tmp_words + words_size) = NULL;
             words_size++;
             words = tmp_words;
