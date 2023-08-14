@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -21,8 +22,8 @@ extern char **words;
 int words_size = 1;
 
 // I hate threads.
-bool server_shutdown = false;
-bool signalled = false;
+sig_atomic_t server_shutdown = 0;
+sig_atomic_t signalled = 0;
 struct List *global_thread_list;
 
 pthread_mutex_t mutex_words = PTHREAD_MUTEX_INITIALIZER;
@@ -52,8 +53,8 @@ void cleanupServer(char **dictionary, int dictsz, struct args *thread_arguments,
                    struct List *thread_list) {
     // This function is only called from main, so
     //  First we wait for all thread activity to stop
-    server_shutdown = true;
-    signalled = true;
+    server_shutdown = 1;
+    signalled = 1;
     int running = -1;
     do {
         pthread_mutex_lock(&mutex_list);
@@ -78,14 +79,8 @@ void cleanupServer(char **dictionary, int dictsz, struct args *thread_arguments,
 void killServer(int sig) {
     // should solicit threads to stop execution at a safe place.
     if (sig == SIGUSR1) {
-        server_shutdown = true;
-        int running = -1;
-
-        do {
-            pthread_mutex_lock(&mutex_list);
-            running = global_thread_list->size;
-            pthread_mutex_unlock(&mutex_list);
-        } while (running != 0);
+        server_shutdown = 1;
+        signalled = 1;
     }
 }
 
@@ -96,6 +91,13 @@ void strlower(char *str) {
     }
 }
 
+// we do a bit of uppercasing
+char *strupper(char *str) {
+    for (int i = 0; i < strlen(str); i++) {
+        *(str + i) = toupper(*(str + i));
+    }
+    return str;
+}
 // Compares the guess given by the client to the wordle being played against
 //  according to the wordle algorithm. Returns a string in result where correct
 //  letter in correct position is capitalized, correct letter in the wrong
@@ -143,6 +145,9 @@ void evaluateWordleGuess(const char *wordle, const char *guess, char *result) {
             *(result + i) = '-';
         }
     }
+
+    free(wordleUsed);
+    free(guessUsed);
 }
 
 // This function just parses the dictionary file.
@@ -191,6 +196,11 @@ void *do_on_thread(void *arguments) {
     // which word from the dictionary is our game played against?
     int dict_index = rand() % dict_sz;
 
+    // May as well check before we start allocating things
+    if (server_shutdown || signalled) {
+        pthread_exit(NULL);
+    }
+
     char *wordle = calloc(6, sizeof(char));
     if (wordle == NULL) {
         fprintf(stderr, "THREAD %lu: ERROR: failed to allocate wordle",
@@ -212,13 +222,13 @@ void *do_on_thread(void *arguments) {
         if (tmp_words != NULL) {
             // TODO: Pretty sure this is a problem, I think i have to allocate
             // lhs first...
-            *(words + words_size - 1) = calloc(1, sizeof(char *));
-            strcpy(*(words + words_size - 1), wordle);
+            *(tmp_words + words_size - 1) = calloc(1, sizeof(char *));
+            strcpy(*(tmp_words + words_size - 1), strupper(wordle));
             *(tmp_words + words_size) = NULL;
             words_size++;
             words = tmp_words;
         } else {
-            server_shutdown = true;
+            server_shutdown = 1;
         }
     }
     pthread_mutex_unlock(&mutex_words);
@@ -274,13 +284,47 @@ void *do_on_thread(void *arguments) {
     bool valid, winner = false;
 
     short net_short;
-    while (guesses_remaining > 0 && !winner) {
+    char *invalid = "?????";
+
+    int thread_epoll = epoll_create(1);
+    if (thread_epoll == -1) {
+        perror("ERROR: epoll_create() failed");
+        free(wordle);
+        free(recv_buffer);
+
+        pthread_mutex_lock(&mutex_list);
+        { removeList(running_threads, pthread_self()); }
+        pthread_mutex_unlock(&mutex_list);
+        pthread_exit(NULL);
+    }
+
+    struct epoll_event event;
+    event.events = EPOLLIN;
+    event.data.fd = csd;
+
+    int t_rc = epoll_ctl(thread_epoll, EPOLL_CTL_ADD, csd, &event);
+    if (t_rc == -1) {
+        perror("ERROR: epoll_ctl() failed");
+        free(wordle);
+        free(recv_buffer);
+        close(thread_epoll);
+
+        pthread_mutex_lock(&mutex_list);
+        { removeList(running_threads, pthread_self()); }
+        pthread_mutex_unlock(&mutex_list);
+        pthread_exit(NULL);
+    }
+
+    while (guesses_remaining > 0 && !winner && !server_shutdown) {
         // First thing we are doing is checking if we have been told to stop.
         // So when the server shuts down, it will finish what it is doing
         //  and then stop before it would have accepted new input.
 
         printf("THREAD %lu: waiting for guess\n", pthread_self());
 
+        t_rc = epoll_wait(thread_epoll, &event, 1, -1);
+        if (server_shutdown)
+            break;
         bytes_recieved = recv(csd, recv_buffer, 6, 0);
 
         if (bytes_recieved == -1) {
@@ -289,6 +333,7 @@ void *do_on_thread(void *arguments) {
             free(wordle);
             free(recv_buffer);
             free(send_buffer);
+            close(thread_epoll);
 
             pthread_mutex_lock(&mutex_list);
             { removeList(running_threads, pthread_self()); }
@@ -306,6 +351,7 @@ void *do_on_thread(void *arguments) {
             free(wordle);
             free(recv_buffer);
             free(send_buffer);
+            close(thread_epoll);
 
             pthread_mutex_lock(&mutex_list);
             { removeList(running_threads, pthread_self()); }
@@ -320,6 +366,7 @@ void *do_on_thread(void *arguments) {
                     free(wordle);
                     free(recv_buffer);
                     free(send_buffer);
+                    close(thread_epoll);
 
                     pthread_mutex_lock(&mutex_list);
                     { removeList(running_threads, pthread_self()); }
@@ -359,8 +406,12 @@ void *do_on_thread(void *arguments) {
                    "guess%s left)\n",
                    pthread_self(), guesses_remaining,
                    (guesses_remaining == 1 ? "" : "es"));
-            sprintf(send_buffer, "N%hd?????", htons(guesses_remaining));
-            bytes_sent = send(csd, send_buffer, strlen(send_buffer), 0);
+
+            memset(send_buffer, 'N', sizeof(char));
+            net_short = htons(guesses_remaining);
+            memcpy(send_buffer + 1, &net_short, sizeof(short));
+            strcpy(send_buffer + 3, invalid);
+            bytes_sent = send(csd, send_buffer, 9, 0);
 
             if (bytes_sent == -1) {
                 perror("ERROR: send() failed");
@@ -368,6 +419,7 @@ void *do_on_thread(void *arguments) {
                 free(wordle);
                 free(recv_buffer);
                 free(send_buffer);
+                close(thread_epoll);
 
                 pthread_mutex_lock(&mutex_list);
                 { removeList(running_threads, pthread_self()); }
@@ -398,12 +450,6 @@ void *do_on_thread(void *arguments) {
 
         net_short = htons(guesses_remaining);
         memcpy(send_buffer + 1, &net_short, sizeof(short));
-        // *(short *)(send_buffer + 1) = htons(guesses_remaining);
-
-        // I guess I'm manually setting the bytes of the send buffer, since no
-        // other method of encoding the guesses remaining worked.
-        // *(send_buffer + 1) = (net_short >> 8) & 0xFF; // High
-        // *(send_buffer + 2) = net_short & 0xFF;        // Low
 
 #ifdef BAD_AT_THIS
         printf("THREAD %lu: contents of send buffer after validation:",
@@ -420,10 +466,10 @@ void *do_on_thread(void *arguments) {
 #endif
 
         // Now we can send a response to the client.
+        bytes_sent = send(csd, send_buffer, 9, 0);
         printf("THREAD %lu: sending reply: %s (%d guess%s left)\n",
                pthread_self(), send_buffer + 3, guesses_remaining,
                (guesses_remaining == 1 ? "" : "es"));
-        bytes_sent = send(csd, send_buffer, 9, 0);
 
         if (bytes_sent == -1) {
             perror("ERROR: send() failed");
@@ -431,6 +477,7 @@ void *do_on_thread(void *arguments) {
             free(wordle);
             free(recv_buffer);
             free(send_buffer);
+            close(thread_epoll);
 
             pthread_mutex_lock(&mutex_list);
             { removeList(running_threads, pthread_self()); }
@@ -444,6 +491,7 @@ void *do_on_thread(void *arguments) {
         free(wordle);
         free(recv_buffer);
         free(send_buffer);
+        close(thread_epoll);
 
         pthread_mutex_lock(&mutex_list);
         { removeList(running_threads, pthread_self()); }
@@ -469,6 +517,7 @@ void *do_on_thread(void *arguments) {
     free(wordle);
     free(recv_buffer);
     free(send_buffer);
+    close(thread_epoll);
 
     pthread_mutex_lock(&mutex_list);
     { removeList(running_threads, pthread_self()); }
@@ -477,12 +526,19 @@ void *do_on_thread(void *arguments) {
     pthread_exit(NULL);
 }
 
-// TODO: fix the signal handler, but only if I really have to :>
 int wordle_server(int argc, char **argv) {
-    signal(SIGINT, SIG_IGN);
-    signal(SIGTERM, SIG_IGN);
-    signal(SIGUSR2, SIG_IGN);
-    // signal(SIGUSR1, killServer);
+    struct sigaction kill_action, ign_action;
+    kill_action.sa_handler = killServer;
+    sigemptyset(&kill_action.sa_mask);
+    kill_action.sa_flags = 0;
+    ign_action.sa_handler = SIG_IGN;
+    sigemptyset(&ign_action.sa_mask);
+    ign_action.sa_flags = 0;
+
+    sigaction(SIGINT, &ign_action, NULL);
+    sigaction(SIGTERM, &ign_action, NULL);
+    sigaction(SIGUSR2, &ign_action, NULL);
+    sigaction(SIGUSR1, &kill_action, NULL);
 
     if (argc != 5) {
         return badInput();
@@ -517,6 +573,8 @@ int wordle_server(int argc, char **argv) {
     FILE *dict_in = fopen(dict_fn, "r");
     if (dict_in == NULL) {
         perror("ERROR: open() failed");
+        free(dict);
+        free(dict_fn);
         return EXIT_FAILURE;
     }
 
@@ -532,6 +590,8 @@ int wordle_server(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
+    fclose(dict_in);
+
 #ifdef BAD_AT_THIS
     printf("MAIN: Successfully populated dictionary.\n");
 #endif
@@ -544,6 +604,11 @@ int wordle_server(int argc, char **argv) {
     int listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener == -1) {
         perror("ERROR: socket() failed");
+        for (int i = 0; i < dict_size; i++) {
+            free(*(dict + i));
+        }
+
+        free(dict);
         return EXIT_FAILURE;
     }
 
@@ -565,6 +630,12 @@ int wordle_server(int argc, char **argv) {
     if (bind(listener, (struct sockaddr *)&tcp_server, sizeof(tcp_server)) ==
         -1) {
         perror("ERROR: bind() failed");
+        for (int i = 0; i < dict_size; i++) {
+            free(*(dict + i));
+        }
+
+        free(dict);
+
         return EXIT_FAILURE;
     }
 
@@ -572,6 +643,11 @@ int wordle_server(int argc, char **argv) {
     // pdf...
     if (listen(listener, 5) == -1) {
         perror("listen() failed");
+        for (int i = 0; i < dict_size; i++) {
+            free(*(dict + i));
+        }
+
+        free(dict);
         return EXIT_FAILURE;
     }
     // Presumably the rest of this is application protocol
@@ -582,25 +658,58 @@ int wordle_server(int argc, char **argv) {
 
     struct args *thread_args = calloc(1, sizeof(struct args));
 
+    int pollfd = epoll_create(1);
+    if (pollfd == -1) {
+        perror("ERROR: epoll_create() failed");
+        for (int i = 0; i < dict_size; i++) {
+            free(*(dict + i));
+        }
+
+        free(dict);
+        free(thread_args);
+        return EXIT_FAILURE;
+    }
+
+    struct epoll_event event;
+    event.events = EPOLLIN | EPOLLOUT;
+    event.data.fd = listener;
+
+    rc = epoll_ctl(pollfd, EPOLL_CTL_ADD, listener, &event);
+    if (rc == -1) {
+        perror("ERROR: epoll_ctl() failed");
+        perror("ERROR: epoll_create() failed");
+        perror("listen() failed");
+        for (int i = 0; i < dict_size; i++) {
+            free(*(dict + i));
+        }
+
+        free(dict);
+        free(thread_args);
+        return EXIT_FAILURE;
+    }
     // Initialize the list...
     struct List *current_threads = newList();
     global_thread_list = current_threads;
     int sd;
+    struct epoll_event ret_events;
     pthread_t new_thread;
-
     // Dont accept any new connections if the server has been killed,
-    // if the server is signaled in the middle of a loop be
+    // if the server is signalled in the middle of a loop
     // any new threads created will terminate without taking input.
     while (!server_shutdown) {
-
-        // Prepare for the next client's socket descriptor...
-        // Block on accept
+        // Poll until the socket is ready, We dont want to hang on the accept
+        // call if the server gets shut down.
+        rc = epoll_wait(pollfd, &ret_events, 1, -1);
+        if (server_shutdown)
+            break;
+        // we should no longer block on accept
         sd = accept(listener, (struct sockaddr *)&remote_client,
                     (socklen_t *)&addrlen);
         if (sd == -1) {
             perror("ERROR: accept() failed");
 
             cleanupServer(dict, dict_size, thread_args, current_threads);
+            close(pollfd);
             return EXIT_FAILURE;
         }
 
@@ -620,6 +729,7 @@ int wordle_server(int argc, char **argv) {
                 printf("MAIN: SIGUSR1 rcvd; Wordle server shutting down...\n");
 
             cleanupServer(dict, dict_size, thread_args, current_threads);
+            close(pollfd);
             return EXIT_SUCCESS;
         }
 
@@ -630,6 +740,7 @@ int wordle_server(int argc, char **argv) {
                     rc);
 
             cleanupServer(dict, dict_size, thread_args, current_threads);
+            close(pollfd);
             return EXIT_FAILURE;
         }
         // Finally, detach the thread so we dont need to join it anymore.
@@ -637,6 +748,7 @@ int wordle_server(int argc, char **argv) {
             fprintf(stderr, "ERROR: pthread_detach failed()\n");
 
             cleanupServer(dict, dict_size, thread_args, current_threads);
+            close(pollfd);
             return EXIT_FAILURE;
         }
 
@@ -651,5 +763,6 @@ int wordle_server(int argc, char **argv) {
     if (signalled)
         printf("MAIN: SIGUSR1 rcvd; Wordle server shutting down...\n");
     cleanupServer(dict, dict_size, thread_args, current_threads);
+    close(pollfd);
     return EXIT_SUCCESS;
 }
