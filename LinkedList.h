@@ -1,9 +1,9 @@
-#include <poll.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <unistd.h>
 /*
   definitions of a node and singly linked list class.
+  in theory, all functions in here are thread safe over the structure of a list.
   each node represents a currently running thread (tid),
   with a socket descriptor (clientsd) representing the tcp connection
   used to communicate with the wordle player.
@@ -15,6 +15,7 @@ struct List {
     struct Node *head;
     struct Node *tail;
     int size;
+    pthread_mutex_t mutex;
 };
 
 struct Node {
@@ -38,13 +39,17 @@ struct List *newList() {
     lst->head = lst->tail = NULL;
     lst->size = 0;
     return lst;
+    pthread_mutex_init(&lst->mutex, NULL);
 }
 
 // Returns the newly added tail of the list.
-
 struct Node *push_back(struct List *lst, int csd, pthread_t thread) {
     struct Node *node = newNode(csd, thread);
+    struct Node *tmp;
+    if (lst == NULL)
+        return NULL;
     // if the list is empty, the new node is the head and tail.
+    pthread_mutex_lock(&lst->mutex);
     if (lst->size == 0) {
         lst->head = node;
         lst->tail = node;
@@ -55,7 +60,21 @@ struct Node *push_back(struct List *lst, int csd, pthread_t thread) {
         lst->tail = node;
         lst->size++;
     }
-    return lst->tail;
+    tmp = lst->tail;
+    pthread_mutex_unlock(&lst->mutex);
+    return tmp;
+}
+
+// This function is only ever called by removeList(), in the event that the node
+// to remove is the only one in the list. Keeps list pointer allocated.
+bool destroyList(struct List *lst) {
+    close(lst->head->clientsd);
+    free(lst->head);
+    lst->head = lst->tail = NULL;
+    lst->size = 0;
+    pthread_mutex_unlock(&lst->mutex);
+    pthread_mutex_destroy(&lst->mutex);
+    return true;
 }
 
 // Removes the node representing the specified thread from the list.
@@ -63,18 +82,36 @@ struct Node *push_back(struct List *lst, int csd, pthread_t thread) {
 // Returns true if there was a node in the list with a matching thread ID, and
 // false otherwise
 bool removeList(struct List *lst, pthread_t thread) {
-    struct Node *ptr = lst->head;
+    if (lst == NULL)
+        return false;
+    pthread_mutex_lock(&lst->mutex);
+    if (lst->size == 1) {
+        return destroyList(lst);
+    }
+
     struct Node *tmp;
-    while (ptr->next != NULL) {
-        if (ptr->next->tid == thread) {
-            tmp = ptr->next->next;
-            close(ptr->next->clientsd);
-            free(ptr->next);
-            ptr->next = tmp;
+    if (lst->head->tid == thread) {
+        tmp = lst->head;
+        lst->head = lst->head->next;
+        close(tmp->clientsd);
+        free(tmp);
+        lst->size--;
+        return true;
+    }
+    struct Node *prev = lst->head;
+    struct Node *ptr = lst->head->next;
+    while (ptr != NULL) {
+        if (ptr->tid == thread) {
+            tmp = ptr->next;
+            close(ptr->clientsd);
+            free(ptr);
+            prev->next = tmp;
             lst->size--;
             return true;
         }
+        prev = ptr;
         ptr = ptr->next;
     }
+    pthread_mutex_unlock(&lst->mutex);
     return false;
 }

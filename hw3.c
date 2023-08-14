@@ -23,7 +23,7 @@ int words_size = 1;
 // I hate threads.
 bool server_shutdown = false;
 bool signalled = false;
-struct List *running_threads;
+struct List *global_thread_list;
 
 pthread_mutex_t mutex_words = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t mutex_losses = PTHREAD_MUTEX_INITIALIZER;
@@ -36,6 +36,7 @@ struct args {
     int csd;
     int dict_len;
     char **dictionary;
+    struct List *thread_list;
 };
 
 int badInput() {
@@ -47,8 +48,8 @@ int badInput() {
 
 // This is called if the server encounters an error and would otherwise shut
 // down. Cleans up all dynamic memory allocated before the server goes live.
-void cleanupServer(char **dictionary, int dictsz,
-                   struct args *thread_arguments) {
+void cleanupServer(char **dictionary, int dictsz, struct args *thread_arguments,
+                   struct List *thread_list) {
     // This function is only called from main, so
     //  First we wait for all thread activity to stop
     server_shutdown = true;
@@ -56,7 +57,7 @@ void cleanupServer(char **dictionary, int dictsz,
     int running = -1;
     do {
         pthread_mutex_lock(&mutex_list);
-        { running = running_threads->size; }
+        { running = thread_list->size; }
         pthread_mutex_unlock(&mutex_list);
     } while (running != 0);
 
@@ -68,7 +69,7 @@ void cleanupServer(char **dictionary, int dictsz,
 
     free(dictionary);
     free(thread_arguments);
-    free(running_threads);
+    free(thread_list);
 }
 
 // Only called if the server recieves SIGUSR1
@@ -79,13 +80,12 @@ void killServer(int sig) {
     if (sig == SIGUSR1) {
         server_shutdown = true;
         int running = -1;
-        pthread_mutex_lock(&mutex_list);
-        {
-            do {
-                running = running_threads->size;
-            } while (running != 0);
-        }
-        pthread_mutex_unlock(&mutex_list);
+
+        do {
+            pthread_mutex_lock(&mutex_list);
+            running = global_thread_list->size;
+            pthread_mutex_unlock(&mutex_list);
+        } while (running != 0);
     }
 }
 
@@ -93,6 +93,55 @@ void killServer(int sig) {
 void strlower(char *str) {
     for (int i = 0; i < strlen(str); i++) {
         *(str + i) = tolower(*(str + i));
+    }
+}
+
+// Compares the guess given by the client to the wordle being played against
+//  according to the wordle algorithm. Returns a string in result where correct
+//  letter in correct position is capitalized, correct letter in the wrong
+//  position is lowercase in the guess position, and wrong letter is just a '-'
+// Expects that all 3 arguments are character strings of length 5 (not including
+//  null terminator)
+// If either wordle or guess point to the same heap memory as result, the state
+//  of all 3 strings after the call is undefined.
+void evaluateWordleGuess(const char *wordle, const char *guess, char *result) {
+    if (wordle == NULL || guess == NULL || result == NULL) {
+        fprintf(stderr, "wordle() failed: NULL pointer arguments\n");
+        return;
+    }
+
+    int i, j;
+    bool *wordleUsed = calloc(5, sizeof(bool));
+    bool *guessUsed = calloc(5, sizeof(bool));
+
+    // Correct letter in correct position
+    for (i = 0; i < 5; i++) {
+        if (*(wordle + i) == *(guess + i)) {
+            *(result + i) = toupper(*(guess + i));
+            *(wordleUsed + i) = true;
+            *(guessUsed + i) = true;
+        }
+    }
+
+    // Check for yellow feedback
+    for (i = 0; i < 5; i++) {
+        if (!*(guessUsed + i)) {
+            for (j = 0; j < 5; j++) {
+                if (!*(wordleUsed + j) && *(wordle + j) == *(guess + i)) {
+                    *(result + i) = *(guess + i);
+                    *(wordleUsed + j) = true;
+                    *(guessUsed + i) = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Mark the rest as gray
+    for (i = 0; i < 5; i++) {
+        if (!*(guessUsed + i)) {
+            *(result + i) = '-';
+        }
     }
 }
 
@@ -138,6 +187,7 @@ void *do_on_thread(void *arguments) {
     char **dict = thread_args->dictionary;
     int dict_sz = thread_args->dict_len;
     char **tmp_words;
+    struct List *running_threads = thread_args->thread_list;
     // which word from the dictionary is our game played against?
     int dict_index = rand() % dict_sz;
 
@@ -221,34 +271,9 @@ void *do_on_thread(void *arguments) {
     }
 
     // For guess validation
-    bool valid = false, winner = false;
-    bool *wordle_matched = calloc(5, sizeof(bool));
+    bool valid, winner = false;
 
-    if (wordle_matched == NULL) {
-        free(wordle);
-        free(recv_buffer);
-        free(send_buffer);
-
-        pthread_mutex_lock(&mutex_list);
-        { removeList(running_threads, pthread_self()); }
-        pthread_mutex_unlock(&mutex_list);
-        pthread_exit(NULL);
-    }
-
-    bool *guess_matched = calloc(5, sizeof(bool));
-    if (guess_matched == NULL) {
-        free(wordle);
-        free(recv_buffer);
-        free(send_buffer);
-        free(wordle_matched);
-
-        pthread_mutex_lock(&mutex_list);
-        { removeList(running_threads, pthread_self()); }
-        pthread_mutex_unlock(&mutex_list);
-        pthread_exit(NULL);
-    }
-
-    short netValue;
+    short net_short;
     while (guesses_remaining > 0 && !winner) {
         // First thing we are doing is checking if we have been told to stop.
         // So when the server shuts down, it will finish what it is doing
@@ -264,8 +289,6 @@ void *do_on_thread(void *arguments) {
             free(wordle);
             free(recv_buffer);
             free(send_buffer);
-            free(wordle_matched);
-            free(guess_matched);
 
             pthread_mutex_lock(&mutex_list);
             { removeList(running_threads, pthread_self()); }
@@ -283,8 +306,6 @@ void *do_on_thread(void *arguments) {
             free(wordle);
             free(recv_buffer);
             free(send_buffer);
-            free(wordle_matched);
-            free(guess_matched);
 
             pthread_mutex_lock(&mutex_list);
             { removeList(running_threads, pthread_self()); }
@@ -299,8 +320,6 @@ void *do_on_thread(void *arguments) {
                     free(wordle);
                     free(recv_buffer);
                     free(send_buffer);
-                    free(wordle_matched);
-                    free(guess_matched);
 
                     pthread_mutex_lock(&mutex_list);
                     { removeList(running_threads, pthread_self()); }
@@ -323,6 +342,8 @@ void *do_on_thread(void *arguments) {
         // check if our guess is in the dictionary
         // We can skip this if we recieved an incorrect number of bytes
         // Since the guess is automatically invalid.
+        valid = false;
+
         if (bytes_recieved == 5) {
             for (int i = 0; i < dict_sz; i++) {
                 if (strcmp(*(dict + i), recv_buffer) == 0) {
@@ -347,8 +368,6 @@ void *do_on_thread(void *arguments) {
                 free(wordle);
                 free(recv_buffer);
                 free(send_buffer);
-                free(wordle_matched);
-                free(guess_matched);
 
                 pthread_mutex_lock(&mutex_list);
                 { removeList(running_threads, pthread_self()); }
@@ -365,71 +384,46 @@ void *do_on_thread(void *arguments) {
         pthread_mutex_unlock(&mutex_guesses);
 
         --guesses_remaining;
-        // Put in the guess validity and # guesses remaining.
-        memset(send_buffer, 'Y', 1);
-        // I know that the low byte of my short will always be here,
-        // And I cant get any other method to actually order the bytes.
-        netValue = htons(guesses_remaining);
-        memcpy(send_buffer + 1, &netValue, sizeof(short));
-        // *(send_buffer + 1) = guesses_remaining & 0xFF;
 
-#ifdef BAD_AT_THIS
-        printf("GUESSES REMAINING Host Order: %04x\n", guesses_remaining);
-        printf("GUESSES REMAINING Net Order: %04x\n", htons(guesses_remaining));
-        printf("CURRENT SEND BUFFER: Y%04x\n", *(uint16_t *)(send_buffer + 1));
-#endif
-
-        // Make sure these two arrays are in the correct initial state
-        for (int i = 0; i < 5; i++) {
-            *(wordle_matched + i) = false;
-            *(guess_matched + i) = false;
-        }
+        // Ensure the buffer is in the same state for every iteration.
+        memset(send_buffer, 0, 9);
 
         if (strcmp(wordle, recv_buffer) == 0) {
             winner = true;
         }
 
-        // Scan for exactly matching letters (correct letter + correct pos).
-        for (int i = 0; i < strlen(wordle); i++) {
-            if (*(wordle + i) == *(recv_buffer + i)) {
-                *(send_buffer + i + 3) = toupper(*(recv_buffer + i));
-                *(wordle_matched + i) = true;
-                *(guess_matched + i) = true;
-            }
-        }
+        evaluateWordleGuess(wordle, recv_buffer, send_buffer + 3);
+
+        memset(send_buffer, 'Y', 1);
+
+        net_short = htons(guesses_remaining);
+        memcpy(send_buffer + 1, &net_short, sizeof(short));
+        // *(short *)(send_buffer + 1) = htons(guesses_remaining);
+
+        // I guess I'm manually setting the bytes of the send buffer, since no
+        // other method of encoding the guesses remaining worked.
+        // *(send_buffer + 1) = (net_short >> 8) & 0xFF; // High
+        // *(send_buffer + 2) = net_short & 0xFF;        // Low
 
 #ifdef BAD_AT_THIS
-        printf("THREAD %lu: Found exact matches, current reply is: %s\n",
-               pthread_self(), send_buffer);
+        printf("THREAD %lu: contents of send buffer after validation:",
+               pthread_self());
+        for (int i = 0; i < 9; i++) {
+            printf(" %02x |", *(send_buffer + i));
+        }
+        printf("\n");
+
+        printf("THREAD %lu: valid: %c  guesses: %02x %02x | %hd reply: %s\n",
+               pthread_self(), *send_buffer, *(send_buffer + 1),
+               *(send_buffer + 2), ntohs(*(short *)(send_buffer + 1)),
+               send_buffer + 3);
 #endif
-
-        // Scan for correct letter in the wrong position
-        // This is really really gross...
-        for (int i = 0; i < strlen(wordle); i++) {
-            if (!(*(guess_matched + i))) {
-                for (int j = 0; j < strlen(wordle); j++) {
-                    if (!(*(wordle_matched + j)) &&
-                        *(wordle + j) == *(recv_buffer + i)) {
-                        *(send_buffer + i + 3) = *(recv_buffer + i);
-                        *(wordle_matched + j) = true;
-                        *(guess_matched + i) = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // One more pass to mark unused letters as wrong
-        for (int i = 0; i < strlen(wordle); i++) {
-            if (!(*guess_matched + i))
-                *(send_buffer + i + 3) = '-';
-        }
 
         // Now we can send a response to the client.
         printf("THREAD %lu: sending reply: %s (%d guess%s left)\n",
                pthread_self(), send_buffer + 3, guesses_remaining,
                (guesses_remaining == 1 ? "" : "es"));
-        bytes_sent = send(csd, send_buffer, strlen(send_buffer), 0);
+        bytes_sent = send(csd, send_buffer, 9, 0);
 
         if (bytes_sent == -1) {
             perror("ERROR: send() failed");
@@ -437,8 +431,6 @@ void *do_on_thread(void *arguments) {
             free(wordle);
             free(recv_buffer);
             free(send_buffer);
-            free(wordle_matched);
-            free(guess_matched);
 
             pthread_mutex_lock(&mutex_list);
             { removeList(running_threads, pthread_self()); }
@@ -452,8 +444,6 @@ void *do_on_thread(void *arguments) {
         free(wordle);
         free(recv_buffer);
         free(send_buffer);
-        free(wordle_matched);
-        free(guess_matched);
 
         pthread_mutex_lock(&mutex_list);
         { removeList(running_threads, pthread_self()); }
@@ -479,8 +469,6 @@ void *do_on_thread(void *arguments) {
     free(wordle);
     free(recv_buffer);
     free(send_buffer);
-    free(wordle_matched);
-    free(guess_matched);
 
     pthread_mutex_lock(&mutex_list);
     { removeList(running_threads, pthread_self()); }
@@ -489,11 +477,12 @@ void *do_on_thread(void *arguments) {
     pthread_exit(NULL);
 }
 
+// TODO: fix the signal handler, but only if I really have to :>
 int wordle_server(int argc, char **argv) {
     signal(SIGINT, SIG_IGN);
     signal(SIGTERM, SIG_IGN);
     signal(SIGUSR2, SIG_IGN);
-    signal(SIGUSR1, killServer);
+    // signal(SIGUSR1, killServer);
 
     if (argc != 5) {
         return badInput();
@@ -595,7 +584,7 @@ int wordle_server(int argc, char **argv) {
 
     // Initialize the list...
     struct List *current_threads = newList();
-
+    global_thread_list = current_threads;
     int sd;
     pthread_t new_thread;
 
@@ -611,7 +600,7 @@ int wordle_server(int argc, char **argv) {
         if (sd == -1) {
             perror("ERROR: accept() failed");
 
-            cleanupServer(dict, dict_size, thread_args);
+            cleanupServer(dict, dict_size, thread_args, current_threads);
             return EXIT_FAILURE;
         }
 
@@ -622,6 +611,7 @@ int wordle_server(int argc, char **argv) {
             thread_args->csd = sd;
             thread_args->dictionary = dict;
             thread_args->dict_len = dict_size;
+            thread_args->thread_list = current_threads;
         }
         pthread_mutex_unlock(&mutex_targs);
 
@@ -629,7 +619,7 @@ int wordle_server(int argc, char **argv) {
             if (signalled)
                 printf("MAIN: SIGUSR1 rcvd; Wordle server shutting down...\n");
 
-            cleanupServer(dict, dict_size, thread_args);
+            cleanupServer(dict, dict_size, thread_args, current_threads);
             return EXIT_SUCCESS;
         }
 
@@ -639,14 +629,14 @@ int wordle_server(int argc, char **argv) {
             fprintf(stderr, "ERROR: pthread_create() failed with code: %d\n",
                     rc);
 
-            cleanupServer(dict, dict_size, thread_args);
+            cleanupServer(dict, dict_size, thread_args, current_threads);
             return EXIT_FAILURE;
         }
         // Finally, detach the thread so we dont need to join it anymore.
         if (pthread_detach(new_thread) != 0) {
             fprintf(stderr, "ERROR: pthread_detach failed()\n");
 
-            cleanupServer(dict, dict_size, thread_args);
+            cleanupServer(dict, dict_size, thread_args, current_threads);
             return EXIT_FAILURE;
         }
 
@@ -660,6 +650,6 @@ int wordle_server(int argc, char **argv) {
     // (server_shutdown == true);
     if (signalled)
         printf("MAIN: SIGUSR1 rcvd; Wordle server shutting down...\n");
-    cleanupServer(dict, dict_size, thread_args);
+    cleanupServer(dict, dict_size, thread_args, current_threads);
     return EXIT_SUCCESS;
 }
