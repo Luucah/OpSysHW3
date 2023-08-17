@@ -57,6 +57,7 @@ void cleanupServer(char **dictionary, int dictsz, struct args *thread_arguments,
     server_shutdown = 1;
     signalled = 1;
     int running = -1;
+
     do {
         pthread_mutex_lock(mutex_list);
         { running = thread_list->size; }
@@ -236,7 +237,7 @@ void *do_on_thread(void *arguments) {
         }
     }
     pthread_mutex_unlock(&mutex_words);
-
+    free(tmp);
     // Checking this variable after every mutex, this is a better alternative to
     // signals, since I dont need to worry about whether a thread currently
     // holds a mutex
@@ -309,8 +310,6 @@ void *do_on_thread(void *arguments) {
             pthread_exit(NULL);
         }
         if (server_shutdown) {
-            if (signalled)
-                printf("MAIN: SIGUSR1 rcvd; Wordle server shutting down...\n");
             break;
         }
         bytes_recieved = recv(csd, recv_buffer, 6, 0);
@@ -656,15 +655,16 @@ int wordle_server(int argc, char **argv) {
             if (errno != EINTR) {
                 // errno == EINTR if a signal is caught (i.e. SIGUSR1)
                 perror("ERROR: select() failed");
+                cleanupServer(dict, dict_size, thread_args, current_threads);
+                return EXIT_FAILURE;
+            } else if (server_shutdown) {
+                break;
+            } else {
+                cleanupServer(dict, dict_size, thread_args, current_threads);
+                return EXIT_FAILURE;
             }
-            cleanupServer(dict, dict_size, thread_args, current_threads);
-            return EXIT_FAILURE;
         }
-        if (server_shutdown) {
-            if (signalled)
-                printf("MAIN: SIGUSR1 rcvd; Wordle server shutting down...\n");
-            break;
-        }
+
         // we should no longer block on accept
         sd = accept(listener, (struct sockaddr *)&remote_client,
                     (socklen_t *)&addrlen);
@@ -713,9 +713,8 @@ int wordle_server(int argc, char **argv) {
 
         // Threads are allowed to remove themselves from the list on
         //  termination, so a mutex is necessary.
-        pthread_mutex_lock(mutex_list);
-        { push_back(current_threads, sd, new_thread); }
-        pthread_mutex_unlock(mutex_list);
+
+        push_back(current_threads, sd, new_thread);
     }
 
     // (server_shutdown == true);

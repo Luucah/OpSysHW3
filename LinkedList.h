@@ -38,8 +38,8 @@ struct List *newList() {
     struct List *lst = calloc(1, sizeof(struct List));
     lst->head = lst->tail = NULL;
     lst->size = 0;
-    return lst;
     pthread_mutex_init(&lst->mutex, NULL);
+    return lst;
 }
 
 // Returns the newly added tail of the list.
@@ -94,6 +94,7 @@ bool removeList(struct List *lst, pthread_t thread) {
         close(tmp->clientsd);
         free(tmp);
         lst->size--;
+        pthread_mutex_unlock(&lst->mutex);
         return true;
     }
     struct Node *prev = lst->head;
@@ -105,6 +106,7 @@ bool removeList(struct List *lst, pthread_t thread) {
             free(ptr);
             prev->next = tmp;
             lst->size--;
+            pthread_mutex_unlock(&lst->mutex);
             return true;
         }
         prev = ptr;
