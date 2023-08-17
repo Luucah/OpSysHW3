@@ -48,7 +48,11 @@ struct Node *push_back(struct List *lst, int csd, pthread_t thread) {
     struct Node *tmp;
     if (lst == NULL)
         return NULL;
+
     // if the list is empty, the new node is the head and tail.
+    if (lst->size == 0)
+        pthread_mutex_init(&lst->mutex, NULL);
+
     pthread_mutex_lock(&lst->mutex);
     if (lst->size == 0) {
         lst->head = node;
@@ -65,18 +69,6 @@ struct Node *push_back(struct List *lst, int csd, pthread_t thread) {
     return tmp;
 }
 
-// This function is only ever called by removeList(), in the event that the node
-// to remove is the only one in the list. Keeps list pointer allocated.
-bool destroyList(struct List *lst) {
-    close(lst->head->clientsd);
-    free(lst->head);
-    lst->head = lst->tail = NULL;
-    lst->size = 0;
-    pthread_mutex_unlock(&lst->mutex);
-    pthread_mutex_destroy(&lst->mutex);
-    return true;
-}
-
 // Removes the node representing the specified thread from the list.
 // Frees the memory allocated to that node, and closes the socket descriptor.
 // Returns true if there was a node in the list with a matching thread ID, and
@@ -86,7 +78,13 @@ bool removeList(struct List *lst, pthread_t thread) {
         return false;
     pthread_mutex_lock(&lst->mutex);
     if (lst->size == 1) {
-        return destroyList(lst);
+        close(lst->head->clientsd);
+        free(lst->head);
+        lst->head = lst->tail = NULL;
+        lst->size = 0;
+        pthread_mutex_unlock(&lst->mutex);
+        pthread_mutex_destroy(&lst->mutex);
+        return true;
     }
 
     struct Node *tmp;
